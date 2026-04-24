@@ -1,0 +1,43 @@
+Attribution-NonCommercial 4.0 International (CC BY-NC 4.0)
+
+Copyright (c) 2026 paradoxlabdev
+
+This repository contains documentation only. The source code of the product
+described in this repository is proprietary to a third-party client and is NOT
+included here.
+
+The documentation, diagrams, and written content in this repository are licensed
+under the Creative Commons Attribution-NonCommercial 4.0 International License.
+
+You are free to:
+
+  - Share — copy and redistribute the material in any medium or format
+  - Adapt — remix, transform, and build upon the material
+
+Under the following terms:
+
+  - Attribution — You must give appropriate credit, provide a link to the
+    license, and indicate if changes were made. You may do so in any reasonable
+    manner, but not in any way that suggests the licensor endorses you or your
+    use.
+
+  - NonCommercial — You may not use the material for commercial purposes.
+
+Full license text: https://creativecommons.org/licenses/by-nc/4.0/legalcode
+
+
+---
+
+Note on proprietary code:
+
+All references to implementation details in this documentation describe
+architectural patterns, design decisions, and technical approaches — not
+verbatim source code from the product. Code samples shown are illustrative
+and have been rewritten or pseudocoded to convey the pattern without
+reproducing the client's intellectual property.
+
+Protocol names mentioned (e.g., specific on-chain platforms) are public
+products that any integrator can build against; naming them does not imply
+any disclosure of proprietary client information.
+
+The client's identity is not disclosed in this documentation.

@@ -1,0 +1,10 @@
+.DS_Store
+*.log
+node_modules/
+.env
+.env.local
+.vscode/
+.idea/
+
+# Portfolio site (lives in this dir for reference, not part of repo)
+160426/
