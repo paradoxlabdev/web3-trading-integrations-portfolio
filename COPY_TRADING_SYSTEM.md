@@ -8,6 +8,7 @@
 - [Ingestion Pipeline](#ingestion-pipeline)
 - [Execution Pipeline](#execution-pipeline)
 - [Wallet Architecture](#wallet-architecture)
+- [Wallet-Custody Migration (Upstream V2 Cutover)](#wallet-custody-migration)
 - [FIFO PnL & Win Rate](#fifo-pnl--win-rate)
 - [Settings & Filters](#settings--filters)
 - [Production Hardening](#production-hardening)
@@ -346,6 +347,54 @@ This prevents the withdraw API from hanging for 2+ minutes on a slow deploy.
 
 ---
 
+## <a id="wallet-custody-migration"></a>Wallet-Custody Migration (Upstream V2 Cutover)
+
+The upstream order-book platform announced a **V2 cutover on a fixed calendar date** — new CLOB SDK, a new collateral token (**pUSD**, wrapped from canonical USDC.e), per-order signed builder attribution, and a new contract set, all flipping at once. Because copy-trading executes follower trades **on that upstream**, the cutover landed squarely on the follower-wallet layer described above. This was not a separate platform integration — it was keeping the **copy-trading wallets** working across a breaking upstream change without stranding live follower funds.
+
+The headline change for us: the follower-wallet custody model moved from a **per-user Safe** to a deterministic **deposit wallet** derived from the follower's EOA. That's the wallet copy trades now fund and execute from.
+
+### What V2 changed (as it touched us)
+
+| Aspect | V1 | V2 |
+|---|---|---|
+| CLOB SDK | v1 client (`chainId` arg) | v2 client (options object, `chain` not `chainId`) |
+| Collateral | USDC.e | **pUSD** (wrapped from USDC.e on first session per wallet) |
+| Order fields | carried `feeRateBps`, `nonce`, `taker` | dropped — protocol charges fees at match time |
+| Builder attribution | builder API key | **per-order signed `builderCode`** (bytes32, part of the signed payload) |
+| Follower custody | per-user Safe | deterministic deposit wallet |
+
+One V1 mechanism was **intentionally preserved**: the gasless-relay HMAC credentials and remote-signing endpoint. That layer is orthogonal to the trading protocol version, so it was deliberately *not* rewritten — a far smaller, safer surface.
+
+### Hot-swap endpoint strategy
+
+Because the cutover was a fixed upstream date, the SDK pointed at a **stable proxy URL** rather than the platform host directly. Pre-cutover the proxy forwarded to the V2 **test** environment; at cutover, swapping the upstream in the proxy config repointed it to production — **no app redeploy, no client-side URL change**. The risky external change became a config flip behind a stable interface.
+
+### The custody change's real failure mode: *invisible* money
+
+At cutover a large set of followers had a foot in both worlds — a DB row that may or may not have recorded their V1 Safe, a deployed Safe possibly still holding pUSD, and a deposit wallet that V2 now treats as the funder. When the **UI** and the **server** resolved *different* funder wallets, withdrawals landed collateral in a wallet no screen was reading. The funds were safe on-chain but invisible to the follower — which to a user is indistinguishable from lost.
+
+Three related bugs, all rooted in that resolver divergence:
+
+1. **Orphan Safe with funds.** A pre-V2 follower could have a NULL Safe in the DB but a deployed Safe holding pUSD on-chain. The client resolver had an orphan-Safe heuristic and read the Safe balance; the server resolver didn't and fell through to the deposit wallet — so every withdraw dropped pUSD on the deposit wallet, invisible to a UI pinned on the Safe.
+   *Fix:* a `/portfolio` banner that appears only when (UI sees a Safe) AND (DB Safe is null) AND (Safe pUSD > dust). One click drains the Safe via the follower's already-initialized relay client and re-inits, flipping the heuristic off so both resolvers realign on the deposit wallet. Open positions/orders block it (sweep-only — ERC-1155 outcome tokens would be orphaned).
+
+2. **Deposit-wallet "bridge" that never bridged.** The deposit-wallet branch of the cross-chain withdraw built a plain `transfer(pUSD, action.toAddress, amount)`. But `action.toAddress` is the recipient on the *destination* chain — for an EVM bridge that's the user's own EOA, which exists at the same address on every EVM chain. So the transfer landed pUSD on the source-chain EOA, the bridge step never ran, and the Cash widget (reading the deposit wallet) showed funds missing. The Safe branch already did it right (encoding the bridge aggregator's actual `transactionRequest`); the deposit-wallet branch was a simpler "just transfer" stub that shipped with the cutover.
+   *Fix:* mirror the Safe path — check the deposit wallet's allowance to the aggregator diamond, approve if needed, then execute the aggregator's real calldata (already built against the deposit wallet as sender).
+
+3. **EOA-stranded pUSD rescue.** Followers hit by #2 had pUSD on their EOA, invisible to every widget and unrecoverable by hand (the EOA is a 7702-delegated account-abstraction wallet, no plain MetaMask access). A dedicated `/portfolio` rescue banner sweeps it back through the correct path.
+
+### Recovery surfaces
+
+All consolidated onto `/portfolio` — one predictable place for a "where did my money go" answer — each a **guarded, sweep-only, one-click** recovery reusing the follower's already-initialized relay client (no new signer setup):
+
+- **`PolymarketWalletUpgradeBanner`** — orphan-Safe drain
+- **`PolymarketEoaRescueBanner`** — EOA-stranded pUSD recovery
+- **`MyriadUsd1RescueBanner`** — unrelated stranded-collateral recovery, moved here in the same pass for consistency (see [MYRIAD_INTEGRATION.md → CLOB Evolution](./MYRIAD_INTEGRATION.md#clob-evolution))
+
+The lesson generalizes: **when a custody model changes, the failure mode isn't lost money, it's *invisible* money** — the fix is realigning the resolvers so the divergence can't recur, plus a guarded recovery surface for anything already stranded.
+
+---
+
 ## FIFO PnL & Win Rate
 
 Accurate attribution across partial fills, redeems, and cross-source trades.
@@ -585,7 +634,8 @@ Honest list:
 - **WS worker single point of failure.** If Railway goes down, falls back to 60s polling (degraded). Running two workers needs cross-worker dedup — backlog item.
 - **No backfill on relationship creation.** When a user adds a new trader, we don't replay trades from before the relationship was created. Discussed with product, decision was "by design" — follower opts in from this moment forward.
 - **`x-on-behalf-of` migration backlog.** Portfolio fetches still use 409-fallback pattern. Cleaner: unified HMAC `on-behalf-of` everywhere (tracked).
+- **Two funder-address resolvers (client + server).** Realigned after the orphan-Safe bug above, but they're still two code paths — a single shared resolver would be the robust fix, and the recovery banners are reactive rather than preventive. Tracked.
 
 ---
 
-*Next: [SECURITY_HIGHLIGHTS.md](./SECURITY_HIGHLIGHTS.md) for the 5 security & correctness fix writeups.*
+*Next: [SECURITY_HIGHLIGHTS.md](./SECURITY_HIGHLIGHTS.md) for the security & correctness fix writeups.*

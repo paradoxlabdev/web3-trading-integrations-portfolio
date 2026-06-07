@@ -1,6 +1,6 @@
 # Technical Highlights — Deep Dive
 
-> Detailed writeups of six technical problems I solved during this engagement. Each includes the problem statement, the approach I evaluated (and what I rejected), the final solution, and measurable impact.
+> Detailed writeups of eight technical problems I solved during this engagement. Each includes the problem statement, the approach I evaluated (and what I rejected), the final solution, and measurable impact.
 
 ## Table of Contents
 
@@ -10,6 +10,8 @@
 - [4. AMM Sell-Output Binary Search — Local Simulation Instead of On-Chain Polling](#amm-binary-search)
 - [5. Post-Trade Polling — Fixing the "Just-Closed" Flash](#post-trade-polling)
 - [6. Concurrent Close Guard — Nonce Collision](#concurrent-close)
+- [7. Read Architecture Under a Hard Rate Budget (Protocol C)](#weight-budget)
+- [8. Agent-Wallet Signing on a Non-EVM Venue (Protocol C)](#agent-wallet)
 
 ---
 
@@ -512,4 +514,86 @@ The user-perceived "time to first meaningful content" went from "blocked on full
 
 ---
 
-*See [MYRIAD_INTEGRATION.md](./MYRIAD_INTEGRATION.md), [LIMITLESS_INTEGRATION.md](./LIMITLESS_INTEGRATION.md), and [COPY_TRADING_SYSTEM.md](./COPY_TRADING_SYSTEM.md) for platform-specific deep-dives.*
+## <a id="weight-budget"></a>7. Read Architecture Under a Hard Rate Budget (Protocol C)
+
+### Problem Statement
+
+Protocol C rate-limits at **1200 weight/min per IP**. The catch: every user served by a given server instance shares that instance's IP, so the budget is **per-server, not per-user**. The initial read layer polled every resource independently:
+
+| Resource | Interval | Weight | Per-user/min |
+|---|---|---|---|
+| orderbook | 2s | 2 | ~60 |
+| open-orders | 5s | 20 | ~240 |
+| positions | 5s | 4 | ~48 |
+| balance | 10s | 4 | ~24 |
+| fills | 15s | 20 | ~80 |
+| **total** | | | **~450** |
+
+At ~450 weight/min/user, **two concurrent users saturated the budget** and a third triggered cascading 429s for *everyone* on the instance — a self-inflicted denial of service that got worse with adoption.
+
+### Approach Rejected: shard users across more IPs
+
+The blunt fix is to run more instances behind more IPs so fewer users share a budget. Rejected as a first move because it scales cost linearly with users without fixing the underlying waste — most of the 450 weight was the orderbook re-fetching data that barely changed between polls, and the venue offered a push channel for exactly that.
+
+### Solution: WebSocket for the hot resource, relax the rest
+
+**1. Move the orderbook to a singleton WebSocket.** It was both the most latency-sensitive surface and the single biggest drain. One WS connection per instance, with **refcounted subscriptions** (subscribe returns an unsubscribe; the server is told to drop a subscription only when its refcount hits zero) and **heartbeat-based zombie detection** (ping after 25s idle, force-close after 50s idle → reconnect path), with **jittered exponential backoff** so a venue blip doesn't cause a synchronized reconnect stampede.
+
+**2. Relax every remaining poll** to the slowest interval each surface tolerates:
+
+| Resource | Before | After | Weight/min after |
+|---|---|---|---|
+| orderbook | 2s poll | **WS** (10s = fallback only) | ~12 |
+| open-orders | 5s | 15s | ~80 |
+| positions | 5s | 15s | ~16 |
+| balance | 10s | 20s | ~12 |
+| fills | 15s | 15s | ~80 |
+| **total** | **~450** | | **~108** |
+
+### Effect
+
+- Per-user read load ~450 → ~108 weight/min — a mechanical change, verifiable from the interval/weight table.
+- Concurrency ceiling per server IP went from ~2–3 users to ~11 before brushing the 1200 limit.
+- Orderbook latency *improved* as a side effect (push vs 2s poll), so the cheaper design was also the faster one.
+
+Full mechanics in [HYPERLIQUID_INTEGRATION.md → WebSocket & the Weight Budget](./HYPERLIQUID_INTEGRATION.md#websocket--the-weight-budget).
+
+---
+
+## <a id="agent-wallet"></a>8. Agent-Wallet Signing on a Non-EVM Venue (Protocol C)
+
+### Problem Statement
+
+Protocol C is non-EVM: trades are **signed REST actions**, not on-chain transactions. Two requirements were in tension:
+
+1. **No wallet popup per trade.** Prompting the user to sign every order is unusable for an active trader.
+2. **The server must not be able to move user funds.** Whatever signs orders automatically must not also be able to withdraw.
+
+A naive "store the user's key and sign with it" satisfies (1) and violates (2) catastrophically.
+
+### Solution: agent wallet with an asymmetric capability boundary
+
+The venue exposes an **agent-wallet** primitive, and the whole design hangs off one asymmetry:
+
+- The user signs an `ApproveAgent` action **once** with their primary wallet (EIP-712), authorizing a dedicated agent key.
+- Orders/cancels are then signed **silently server-side** by the agent key. The signing scheme: msgpack-encode the action, `keccak256(msgpack || nonce || vault || expiresAfter)`, EIP-712 sign over a **phantom `chainId=1337` domain** (a protocol constant, since the L1 isn't a real EVM network).
+- **Withdrawals stay user-signed** (`withdraw3`). The agent can place and cancel orders; it **cannot pull funds out**. That single asymmetry is the security boundary.
+
+### Defending the agent key at rest
+
+Encryption-at-rest alone wasn't enough — it protects confidentiality but not *binding*. A DB row swap could move user A's encrypted key into user B's row and let B sign as A. The fix binds each ciphertext to its owner via **AES-256-GCM AAD = userId**, so a swapped row fails the auth-tag check on decrypt (cryptographic integrity, not application-logic ownership checks). Backwards-compatible decrypt + key rotation via a previous-keys list. Detailed in [SECURITY_HIGHLIGHTS.md → Agent-Key Cross-User Decryption](./SECURITY_HIGHLIGHTS.md#8-agent-key-aad).
+
+### The nonce trap
+
+Nonces must be unique and within the venue's accepted range. The first version used `Date.now() * 1000` to leave room for a counter — but that overflowed the venue's max nonce (~1.78 quadrillion vs an accepted ceiling around `Date.now()` itself), and **every order was rejected**. Fixed to `BigInt(Date.now()) + BigInt(random(0..999))`: within ~1s of real time, with a random suffix to avoid same-millisecond collisions. Nonces are generated per request server-side, so there's no client-side nonce state to race.
+
+### Effect
+
+- Active trading with **zero wallet popups** after a one-time approval, while the server provably cannot withdraw.
+- A key-custody posture that survives a DB compromise of the encrypted column (AAD binding) and, separately, an agent-key compromise (withdrawals user-signed).
+
+Full mechanics in [HYPERLIQUID_INTEGRATION.md → Agent-Wallet Signing Model](./HYPERLIQUID_INTEGRATION.md#agent-wallet-signing-model).
+
+---
+
+*See [MYRIAD_INTEGRATION.md](./MYRIAD_INTEGRATION.md), [LIMITLESS_INTEGRATION.md](./LIMITLESS_INTEGRATION.md), [HYPERLIQUID_INTEGRATION.md](./HYPERLIQUID_INTEGRATION.md), and [COPY_TRADING_SYSTEM.md](./COPY_TRADING_SYSTEM.md) for platform-specific deep-dives.*
