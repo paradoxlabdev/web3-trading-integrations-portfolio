@@ -75,6 +75,7 @@ My scope over ~4 months covered **three protocol integrations plus a copy-tradin
 - Portfolio integration (on-chain CTF positions), Explore filter, trade history
 - Open orders aggregated across markets in portfolio
 - Live Crypto page integration, sports leagues, group markets, oracle charts
+- Recurring **crypto-binary (Up/Down)** markets (5min–daily cadence) with auto-rolling rounds, Chainlink OHLCV candle chart, and a new `oraclePriceData` WS stream
 
 ### Protocol C Integration (outcome markets on a non-EVM L1)
 - `Platform` union + Explore filter + i18n (`hyperliquid.*`); single-env-var testnet switch for the whole stack

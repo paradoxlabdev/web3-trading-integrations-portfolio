@@ -1,6 +1,6 @@
 # Protocol B Integration — Hybrid CLOB + AMM Prediction Market
 
-> Full integration of a hybrid order-book + AMM prediction-market platform. Scope included a three-phase auth migration, CLOB and AMM trading, limit orders, WebSocket live feeds, redeem flow, and portfolio aggregation — spanning Base and Polygon chains.
+> Full integration of a hybrid order-book + AMM prediction-market platform. Scope included a three-phase auth migration, CLOB and AMM trading, limit orders, WebSocket live feeds, redeem flow, portfolio aggregation, and a later **recurring crypto-binary (Up/Down) market type** with an oracle candle chart — spanning Base and Polygon chains.
 
 ## Table of Contents
 
@@ -14,6 +14,7 @@
 - [Redeem Flow](#redeem-flow)
 - [Portfolio & Position Reconciliation](#portfolio--position-reconciliation)
 - [Live Crypto, Sports, Group Markets](#live-crypto-sports-group-markets)
+- [Crypto-Binary (Up/Down) Recurring Markets](#crypto-binary-recurring-markets)
 - [Performance Work](#performance-work)
 
 ---
@@ -24,10 +25,10 @@ Protocol B is a hybrid prediction-market platform:
 
 - **Liquidity model:** CLOB (central limit order book) for popular markets, AMM fallback for thin books
 - **Collateral:** USDC on Base + Polygon
-- **Market types:** binary, multi-outcome (NegRisk), group markets (linked sub-markets), oracle-driven (live crypto)
+- **Market types:** binary, multi-outcome (NegRisk), group markets (linked sub-markets), oracle-driven (live crypto), and recurring **crypto-binary (Up/Down)** markets on a fixed cadence
 - **Settlement:** Conditional Token Framework (CTF) — ERC-1155 positions with on-chain redemption
 
-The integration is substantial: roughly two months of work, four market types (binary, multi-outcome / NegRisk, group, oracle-driven live crypto), two chains (Base + Polygon).
+The integration is substantial: five market types (binary, multi-outcome / NegRisk, group, oracle-driven live crypto, and recurring crypto-binary Up/Down), two chains (Base + Polygon), spanning the initial build and a later crypto-binary phase.
 
 ---
 
@@ -70,6 +71,14 @@ The integration is substantial: roughly two months of work, four market types (b
 - Live-crypto page: 2-phase fetch (markets → tiles → positions)
 - Sports leagues filter added
 - Group markets (linked sub-markets): parent image inherited by sub-positions, shared cache via globalThis
+
+### Crypto-Binary (Up/Down) Recurring Markets
+
+- New recurring market type (5min / 15min / hourly / 4hour / daily) — see [section below](#crypto-binary-recurring-markets)
+- Series resolver (current + next round), past-results ribbon, Chainlink OHLCV candle chart
+- New `oraclePriceData` WS stream for the underlying-asset chart
+- Probability-bar correctness fixes (CLOB event wiring + real midpoint)
+- 5-min/15-min filter categorization fix; server-side `profileId` hydration
 
 ### Portfolio
 
@@ -317,10 +326,13 @@ This aggregation was a separate feature — previously open orders were only vis
 
 Protocol B exposes a WebSocket feed for:
 
-- Orderbook updates (per-market)
-- Price updates (per-token)
+- Orderbook updates (per-market) — `orderbookUpdate` for CLOB markets
+- Price updates (per-token) — `newPriceData` for AMM markets
+- **Oracle price stream** (`oraclePriceData`) — Chainlink-sourced underlying-asset price, used by the crypto-binary candle chart (see [Crypto-Binary Recurring Markets](#crypto-binary-recurring-markets))
 - Market lifecycle events (`marketResolved`, `marketExpired`)
 - User-specific events (`order_filled`, `order_cancelled`)
+
+> The `orderbookUpdate` (CLOB) vs `newPriceData` (AMM) split matters: a consumer wired to the wrong one silently receives nothing. This bit the probability bar — see the crypto-binary section.
 
 ### Client implementation
 
@@ -459,6 +471,56 @@ Group markets are multi-market events (e.g. "Who wins the election?" with 20 can
 ### Oracle chart
 
 Live-crypto markets pull price data from an oracle feed. Chart renders a thin line of the oracle price over the observation window, with horizontal threshold lines at each market's strike. Helpful for users to see "how far am I from the threshold?"
+
+---
+
+## <a id="crypto-binary-recurring-markets"></a>Crypto-Binary (Up/Down) Recurring Markets
+
+Shipped after the initial integration (design finalized early in the second phase of work). This is a distinct **new market type**, not the same thing as the oracle chart above: short-duration **Up/Down bets on a crypto price** that **auto-roll on a fixed cadence** — each round is its own standalone CLOB market instance that the platform creates on a timer.
+
+### What it is
+
+- **Cadences:** `5min`, `15min`, `hourly`, `4hour`, `daily` — a *series* (e.g. `btc-15min-price`) spawns a fresh round every interval.
+- **Each round** is an independent binary market (price Up vs Down over the window) settled on the CLOB, with on-chain CTF positions like any other Protocol B market.
+- **Underlying assets:** BTC / ETH and others; a symbol-detection fallback covers assets the platform doesn't expose a stable series slug for (XRP was the confirmed case).
+
+### Server routes added
+
+| Route | Purpose | Cache |
+|---|---|---|
+| `/api/limitless/crypto-binary-series` | resolve the **current + next** instance of a series | 5s |
+| `/api/limitless/crypto-binary-past-results` | historical resolved rounds (winning side, open/close price) | 5min — results are monotonic, never change once settled |
+| `/api/limitless/crypto-binary-price` | Chainlink **OHLCV** candles for the underlying-asset chart (1m / 5m / 15m / 1h / 4h / 1d) | edge-cached |
+
+These deliberately sit on the platform's *documented* `markets/stable/{slug}` + timeline endpoints plus a Chainlink price source, rather than a bespoke accumulator — fewer moving parts to drift.
+
+### The candle chart & its data source
+
+The chart plots the **underlying asset** (not the market probability) as candles from the Chainlink OHLCV route, and overlays the live price from the WebSocket **`oraclePriceData`** stream (Chainlink Data Streams). This is a separate feed from the orderbook/probability data — a point that caused two bugs below. Historical oracle prices are accumulated client-side so the candle chart fills in as the round progresses.
+
+### Auto-rollover & cache invalidation
+
+When a round resolves, the WS `marketResolved` event must refresh the series cache so the UI advances to the next round — but the user may also click forward *before* the resolution event lands. The naive single-effect invalidation (only when `marketResolved.slug === currentSlug`) left stale data in both edge cases. Fixed with a **two-effect pattern**:
+
+- **Series cache** invalidates on **any** `marketResolved` event, *and* on `currentSlug` change (user navigation).
+- **Past-results synthesis** keeps the strict slug-equality gate, so the results ribbon can't be corrupted by an unrelated market's resolution.
+
+### Probability bar — two correctness fixes
+
+The Up/Down probability bar was effectively dead on these markets until:
+
+1. **Wrong event.** It listened to `newPriceData` (an **AMM**-only event). Crypto-binary rounds subscribe by market slug on the **CLOB**, so only `orderbookUpdate` ever fired — the bar froze (limping along only via the REST refetch fallback). Fixed by wiring both `orderbookUpdate` (CLOB) and `newPriceData` (AMM) consumers.
+2. **Clamped midpoint.** Even once fed, it read `orderbook.adjustedMidpoint`, which the platform clamps to 0.5 when the spread is wide — and 5-min books are intentionally thin, so it sat pinned at 50/50. Fixed with a helper that prefers the real `midpoint` ((best_bid + best_ask) / 2) with a fallback chain.
+
+### 5-min vs 15-min categorization
+
+The platform tags every recurring binary with a generic `Minutely` tag **plus** a granular `Minutes 5` / `Minutes 15`. The duration mapper checked the generic tag first, collapsing **both** cadences into the `15M` live-crypto filter bucket. Reordered to check granular before generic (and dropped the info-free `Minutely`), so 5-min and 15-min markets now filter correctly — both cadences ship in production.
+
+### profileId read-side hydration
+
+CLOB order submission needs the platform's numeric `profileId` (the `ownerId` on `/orders`). It was only written to localStorage by the order-submit path, so the **History** and **Open Orders** tabs silently returned `[]` on a fresh browser session (no bootstrap). Added `resolveLimitlessProfileId` — checks localStorage, falls back to a server route (`/api/limitless/profile?address=...`), and writes back — so read-only consumers hydrate without first placing an order.
+
+> Wallet note: crypto-binary trades, like all Protocol B trades, execute from the user's **EOA on Base** — they do not use the deposit-wallet/Safe custody path from the copy-trading migration. The wallet-migration and crypto-binary work happened to share release branches but are orthogonal.
 
 ---
 
