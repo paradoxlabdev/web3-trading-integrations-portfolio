@@ -19,7 +19,7 @@
 
 ## System Overview
 
-The product is a **multi-platform prediction-market aggregator**. Three integrations I shipped plug into it as peer modules, all exposing a common internal contract:
+The product is a **multi-platform prediction-market aggregator**. Three protocol integrations plus a copy-trading module plug into it as peer modules, all exposing a common internal contract:
 
 ```
 ┌───────────────────────────────────────────────────────────────────────┐
@@ -27,31 +27,35 @@ The product is a **multi-platform prediction-market aggregator**. Three integrat
 │  (platform-agnostic event cards, position rows, trade-history tables)  │
 └───────────────────────────┬───────────────────────────────────────────┘
                             │
-         ┌──────────────────┼──────────────────┬────────────────────┐
-         │                  │                  │                    │
-         ▼                  ▼                  ▼                    ▼
-┌────────────────┐ ┌─────────────────┐ ┌──────────────────┐ ┌──────────────┐
-│  Protocol A    │ │   Protocol B    │ │  Protocol C      │ │  Copy-Trading│
-│  Integration   │ │   Integration   │ │  (upstream only) │ │    Module    │
-│                │ │                 │ │                  │ │              │
-│ BSC binary-opt │ │ CLOB+AMM hybrid │ │ Order-book       │ │ WS worker    │
-│ + candle mkts  │ │ + HMAC auth     │ │ (Data API)       │ │ + FIFO PnL   │
-└────────────────┘ └─────────────────┘ └──────────────────┘ └──────────────┘
-         │                  │                                     │
-         └──────────────────┴────────────┬────────────────────────┘
+     ┌──────────────┬───────┼───────┬──────────────────────┐
+     │              │       │       │                      │
+     ▼              ▼       ▼       ▼                      ▼
+┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────────────┐
+│Protocol A│ │Protocol B│ │Protocol C│ │   Copy-Trading       │
+│          │ │          │ │          │ │   Module             │
+│BSC binary│ │CLOB+AMM  │ │outcome   │ │   WS worker + FIFO   │
+│-opt, AMM │ │+ HMAC    │ │mkts on   │ │   PnL — executes on  │
+│+ CLOB,   │ │auth      │ │non-EVM   │ │   an external order- │
+│candles   │ │          │ │L1, agent │ │   book upstream      │
+│          │ │          │ │wallets   │ │   (carried thru V2)  │
+└──────────┘ └──────────┘ └──────────┘ └──────────────────────┘
+     │              │           │                  │
+     └──────────────┴───────────┴────────┬─────────┘
                                          │
-                            ┌────────────▼────────────┐
-                            │  Shared Primitives      │
-                            │                         │
-                            │  - PlatformIcon / name  │
-                            │  - Normalizer protocol  │
-                            │  - Position state FSM   │
-                            │  - Trade-history DB     │
-                            │  - On-chain CTF balance │
-                            │  - Bridge / i18n config │
-                            │  - Sentry helpers       │
-                            └─────────────────────────┘
+                       ┌─────────────────▼───────┐
+                       │  Shared Primitives      │
+                       │                         │
+                       │  - PlatformIcon / name  │
+                       │  - Normalizer protocol  │
+                       │  - Position state FSM   │
+                       │  - Trade-history DB     │
+                       │  - On-chain CTF balance │
+                       │  - Bridge / i18n config │
+                       │  - Sentry helpers       │
+                       └─────────────────────────┘
 ```
+
+> Naming: Protocol A/B are the EVM AMM/CLOB venues, Protocol C is the non-EVM outcome-market venue (agent-wallet signing, see below). The **copy-trading module** is not a numbered protocol — it executes follower trades on an **external order-book upstream**, and was carried through that upstream's V2 cutover (new SDK, pUSD collateral, follower-wallet custody migration). Each integration implements the same internal interfaces below; the signing/auth layer is where they diverge most.
 
 Each integration implements the same internal interfaces:
 
@@ -94,10 +98,12 @@ Each integration implements the same internal interfaces:
 - Custom hooks encapsulate each integration's "read" API:
   - `useMyriadPositions`, `useMyriadPrice`, `useMyriadTrade`
   - `useLimitlessOrderbook`, `useLimitlessOpenOrders`, `useLimitlessPositions`
+  - `useHyperliquidOrder`, `useHyperliquidBalance`, `useHyperliquidAutoDeposit`, `useHyperliquidWithdraw` (+ WS singleton for orderbook / user events)
   - `useCopyTradingExposure`, `useCopyTradingHistory`
 - API routes at `src/app/api/` proxy sensitive calls server-side:
   - API-key masking (upstream protocols)
   - HMAC signing of Protocol B requests
+  - **Agent-wallet signing of Protocol C orders** (agent key decrypted server-side, never sent to the client)
   - Stamped-request validation before DB writes
   - `captureApiError` with category/tags for Sentry
 
@@ -267,6 +273,21 @@ Evolution across three iterations:
 Impact: eliminated the 429-cascade class of incidents entirely.
 
 See [LIMITLESS_INTEGRATION.md](./LIMITLESS_INTEGRATION.md) for migration details.
+
+### Protocol C: agent-wallet (off-chain L1 signing)
+
+Protocol C is non-EVM — trades are signed REST actions, not transactions — so neither API keys nor HMAC fit. The venue's **agent-wallet** primitive is used instead:
+
+- User signs an `ApproveAgent` action **once** with their primary wallet (EIP-712), authorizing a dedicated agent key.
+- Every subsequent order/cancel is signed **silently server-side** by that agent key (msgpack action → keccak action-hash → EIP-712 over a phantom `chainId=1337` domain). No wallet popup per trade.
+- **Withdrawals are deliberately user-signed** (`withdraw3`) — the agent can place and cancel orders but **cannot move funds out**. That asymmetry is the security boundary of the whole model.
+- Agent keys are encrypted at rest with **AES-256-GCM**, with the **userId as AAD** — a row copied to another user fails to decrypt. Key rotation is supported via a previous-keys fallback list.
+
+This is a third distinct auth posture alongside API-key masking (Protocol A) and HMAC delegation (Protocol B). See [HYPERLIQUID_INTEGRATION.md → Agent-Wallet Signing Model](./HYPERLIQUID_INTEGRATION.md#agent-wallet-signing-model).
+
+### Copy-trading upstream: V2 cutover (builder attribution + custody)
+
+The order-book upstream that copy-trading executes on went through a V2 cutover that replaced V1 builder-API-key attribution with a **per-order signed `builderCode`** field (part of the signed payload, so it can't be stripped in transit) and moved follower-wallet custody from per-user smart-contract wallets to deterministic deposit wallets. The gasless-relay HMAC credentials from V1 were **intentionally preserved** (orthogonal to the trading protocol version). This was copy-trading wallet work, not a separate integration — see [COPY_TRADING_SYSTEM.md → Wallet-Custody Migration](./COPY_TRADING_SYSTEM.md#wallet-custody-migration).
 
 ---
 

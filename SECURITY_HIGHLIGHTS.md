@@ -1,6 +1,6 @@
 # Security & Correctness Fixes
 
-> Five production-grade security or correctness issues identified, investigated, and fixed during the engagement. Each writeup includes the issue, how it was found, exploitation scenario (where relevant), and the specific fix. Severity ranges from Critical to Low — these are internal fixes in a closed-source product, not publicly-disclosed CVEs.
+> Eight production-grade security or correctness issues identified, investigated, and fixed during the engagement. Each writeup includes the issue, how it was found, exploitation scenario (where relevant), and the specific fix. Severity ranges from Critical to Low — these are internal fixes in a closed-source product, not publicly-disclosed CVEs. The first five came out of the copy-trading and Protocol A/B work; the last three out of the Protocol C/D integrations.
 
 ## Table of Contents
 
@@ -9,6 +9,9 @@
 - [3. Stamped-Request Auth Broken by Body Consumption](#3-stamped-request-auth-broken-by-body-consumption)
 - [4. EOA Lookup Case-Sensitivity](#4-eoa-lookup-case-sensitivity)
 - [5. FOK Fill Without `orderID` Retried Indefinitely](#5-fok-fill-without-orderid-retried-indefinitely)
+- [6. Bridge Over-Sweep on Withdraw Recovery (Protocol C)](#6-bridge-over-sweep)
+- [7. Double-Withdraw on Lost Response (Protocol C)](#7-double-withdraw)
+- [8. Agent-Key Cross-User Decryption (Protocol C)](#8-agent-key-aad)
 - [Process & Methodology](#process--methodology)
 
 ---
@@ -352,6 +355,113 @@ Also added explicit non-retriable shape for the related "min size" / "invalid am
 
 ---
 
+## <a id="6-bridge-over-sweep"></a>6. Bridge Over-Sweep on Withdraw Recovery (Protocol C)
+
+### Severity
+High (fund-loss-adjacent) — moved more of the user's money than they asked to, across a chain bridge.
+
+### Discovery
+Code review of the stranded-balance recovery path while hardening the withdraw flow.
+
+### Issue
+
+Protocol C withdrawals route funds Arbitrum-side, and a recovery banner re-bridges if the active-bridge state goes stale (> 30 min). That recovery path bridged the user's **full live source-chain balance** instead of the **expected withdraw amount**:
+
+```text
+User has $50 pre-existing USDC on the source chain
+User withdraws $100 from the venue
+Recovery path bridges min — no: bridges the full $150 live balance
+→ the $50 the user never asked to move gets swept across the bridge
+```
+
+The pre-existing balance wasn't lost (it lands at the destination), but it crossed a bridge the user didn't authorize for it, with bridge fees and a destination chain they may not have wanted it on.
+
+### Fix
+
+Cap the bridge amount at `min(liveBalance, expectedAmount)`, and persist `expectedAmount` to localStorage when the withdraw is initiated so the recovery path knows the right figure even after a reload:
+
+```ts
+const bridgeAmount = min(liveBalance, expectedAmount) // never sweep more than was withdrawn
+```
+
+This mirrors the general principle behind the deposit baseline (pre-existing funds are established as a floor and never swept — see [HYPERLIQUID_INTEGRATION.md → Watched deposit](./HYPERLIQUID_INTEGRATION.md#deposit--auto-fund-pipeline)).
+
+### Commit reference
+`security(hyperliquid): fix bridge over-sweep, IOC close, nonce collisions + hardening`
+
+---
+
+## <a id="7-double-withdraw"></a>7. Double-Withdraw on Lost Response (Protocol C)
+
+### Severity
+High — could issue a second withdrawal of real funds on a network blip.
+
+### Discovery
+Hardening review of the withdraw confirm path — reasoning through "what if the response never comes back".
+
+### Issue
+
+The withdraw `/confirm` POST signs and submits a `withdraw3` to the venue. If the request **reaches the venue and executes** but the **response is lost** (network drop, tab close, browser crash), the client doesn't know it succeeded. A retry signs a fresh nonce and issues a **second** withdrawal — double-spending the user's own balance out.
+
+This is the classic at-least-once vs at-most-once problem on a money mutation, where the venue is the source of truth but the client can't observe the outcome.
+
+### Fix
+
+A **pessimistic flag set before the POST, not in the success handler** — assume the mutation may have happened the moment the request leaves:
+
+```ts
+// Set IMMEDIATELY before POST
+localStorage.setItem(
+  `hl-withdraw-pending-${addr.toLowerCase()}`,
+  String(Date.now() + 5 * 60 * 1000),
+)
+// ...POST /confirm...
+```
+
+- **Explicit 4xx/5xx** (response with body) → the venue rejected it and never withdrew → **clear** the flag, retry is safe.
+- **Network error** (no response) → the venue's state is unknown → **keep** the flag, default to "wait".
+- The flag **auto-expires after 5 min** so a genuinely-stuck user isn't locked out forever. The UI disables the button and shows a countdown while it's set.
+
+### Commit reference
+`fix(hyperliquid): block double-withdraw on connection drop mid-/confirm`
+
+---
+
+## <a id="8-agent-key-aad"></a>8. Agent-Key Cross-User Decryption (Protocol C)
+
+### Severity
+High — a DB-level row swap could let one user sign as another's trading agent.
+
+### Discovery
+Security code-review pass on the agent-wallet custody model (review task batch).
+
+### Issue
+
+Protocol C signs orders with a per-user **agent private key** stored encrypted at rest. The key was encrypted with AES-256-GCM but the ciphertext **wasn't bound to its owner**. So an attacker with DB write access (or a logic bug that mixed rows) could copy user A's encrypted agent key into user B's row, and user B's server-side signing path would happily decrypt and sign **as user A's agent** — placing/cancelling orders on A's account.
+
+Encryption-at-rest protected the key's *confidentiality* but not its *binding* to a user.
+
+### Fix
+
+Bind each ciphertext to its userId via the AES-256-GCM **Additional Authenticated Data (AAD)** parameter:
+
+```text
+ciphertext = AES-256-GCM(plaintext = agentPrivKey,
+                         key       = master key,
+                         aad       = userId)
+```
+
+A row swapped to a different userId now fails the **auth-tag check** on decrypt — the integrity failure is cryptographic, not dependent on application logic remembering to check ownership. Decrypt is backwards-compatible (tries with-AAD first, falls back to no-AAD so pre-existing rows still load), and the same pass added key rotation via a comma-separated previous-keys fallback list.
+
+### Lesson
+
+Encryption-at-rest answers "can an attacker read it"; it does **not** answer "can an attacker move it somewhere it'll be trusted". AAD turns the cipher itself into the ownership check. Withdrawals staying user-signed (not agent-signed) is the second layer: even a fully compromised agent key can't pull funds.
+
+### Commit reference
+`chore(hyperliquid): code-review batch 2 — encryption AAD, dedup, UI plumbing`
+
+---
+
 ## Process & Methodology
 
 ### How these were found
@@ -383,7 +493,7 @@ captureApiError(error, {
   endpoint: 'route_name',
   extra: { /* relevant payload, no secrets */ },
   tags: {
-    platform: 'limitless' | 'myriad' | 'copy-trading' | 'polymarket',
+    platform: 'limitless' | 'myriad' | 'hyperliquid' | 'copy-trading' | 'polymarket',
     category: 'auth' | 'trading' | 'correctness' | 'performance',
     severity: 'critical' | 'high' | 'medium' | 'low',
     userFacing: 'true' | 'false',

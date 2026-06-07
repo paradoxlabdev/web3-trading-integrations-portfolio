@@ -1,6 +1,6 @@
-# Protocol A Integration — Binary-Options AMM on BSC
+# Protocol A Integration — Binary-Options AMM on BSC (+ CLOB Evolution)
 
-> Full integration of an on-chain binary-options platform into the product. Scope included the trading hook, portfolio view, candle-markets page, cross-chain deposit/withdraw, and stablecoin auto-swap.
+> Full integration of an on-chain binary-options platform into the product. Scope included the trading hook, portfolio view, candle-markets page, cross-chain deposit/withdraw, and stablecoin auto-swap. A later phase added a **CLOB order-book** path alongside the original AMM, with EIP-1271 smart-wallet signing and swap-on-trade collateral handling.
 
 ## Table of Contents
 
@@ -11,6 +11,7 @@
 - [Candle Markets](#candle-markets)
 - [Cross-Chain Deposit & Withdraw](#cross-chain-deposit--withdraw)
 - [USDT ↔ USD1 Auto-Swap](#usdt--usd1-auto-swap)
+- [CLOB Evolution](#clob-evolution)
 - [Normalizer Design](#normalizer-design)
 - [Testing](#testing)
 - [Production Hardening](#production-hardening)
@@ -307,6 +308,54 @@ async function autoSwapUsd1ToUsdt(amountUsd1: bigint, userAddress: Address) {
 ### Bug I fixed mid-engagement
 
 Initial implementation failed silently when `collateralToken` was a symbol ("USD1") rather than an address. The redeem flow read the market's `collateralToken` field, assumed it was an address, and called `getContract` which returned a zero-address contract that silently no-op'd. Fix: resolve symbol → address at the normalizer layer, so downstream code always gets an address.
+
+---
+
+## CLOB Evolution
+
+The original integration was AMM-only: every trade was a quote → calldata → execute round-trip against a per-market pool. A later phase added a **central-limit-order-book (CLOB)** path so the same markets could be traded against resting liquidity, unifying the UX with the order-book venues (Protocol B/C). The two liquidity models now coexist behind one trading panel.
+
+### Why this was non-trivial
+
+Three things made the CLOB path harder than "add another endpoint":
+
+1. **EIP-1271 signing.** Orders are signed by the user's **smart-contract wallet**, not an EOA. So order signatures are validated via EIP-1271 (`isValidSignature`) rather than `ecrecover`. The order's typed-data domain and the contract addresses are published in the protocol's **docs, not its API** — they had to be transcribed into the constants module and kept in sync by hand.
+2. **Collateral mismatch on every trade.** The CLOB settles in **USD1**, but users hold canonical **USDT**. So each trade carries a swap leg: ensure USD1 before a BUY, sweep USD1 back to USDT after a fill. That sweep-back (`pollAndSwapBackOnFill`) became the single most bug-prone piece of the stack.
+3. **18-decimal wire format.** Order book sizes/prices are 18-decimal uint256 strings on the wire, not human decimals — a class of bug that silently rotted a test fixture (`BigInt("0.5")` throws; the fixture had to be rebased to `"500000000000000000"`).
+
+### Swap-on-trade lifecycle
+
+```
+BUY:
+  ensureUsd1Available(amount)         // swap USDT → USD1 if short (budgeted against real ask, not padded limit)
+    → submit CLOB order (EIP-1271)
+    → pollAndSwapBackOnFill           // if BUY killed/partial, sweep stranded pre-buy USD1 back to USDT
+
+SELL:
+  ensureOutcomeTokenApprovedForSell   // idempotent — skip if already approved
+    → submit CLOB order (EIP-1271)
+    → pollAndSwapBackOnFill           // on fill, sweep full USD1 proceeds back to USDT
+```
+
+### `pollAndSwapBackOnFill` invariants
+
+Five production bugs traced through this one function in a single week, so its behavior is now pinned by unit tests asserting five invariants:
+
+- **SELL filled** → sweep proceeds (regardless of delta)
+- **BUY killed** → sweep the stranded pre-buy USD1 (don't leave the user holding USD1 they only acquired to trade)
+- **USD1 balance = 0** → no swap, no sponsored userOp (don't fire an empty transaction)
+- **Non-terminal order status** → keep polling until the poll timeout
+- **Transient `fetchOrderStatus` error** → continue the loop, don't abort the sweep
+
+Tests mock at the dependency boundary (public client, sponsored-wallet client, swap builder, order-status fetch) so the system-under-test runs **unmodified production code paths** — no network, no wallet.
+
+### Stranded-USD1 recovery
+
+If a sweep-back never completes (settlement race, multi-tab, timeout), the user is left holding USD1 they can't spend elsewhere. A `/portfolio` rescue banner (`MyriadUsd1RescueBanner`) sweeps it on demand via a sponsored userOp at a 0.5% slippage floor — the same "recover stranded balance" pattern used for the [copy-trading wallet-custody migration](./COPY_TRADING_SYSTEM.md#wallet-custody-migration).
+
+### Schema-drift smoke test
+
+Because the order-book contract is documented out-of-band (docs, not a typed API), upstream schema drift (decimal scale, field renames, response shape) would only surface via the first user's broken order. A read-only smoke script validates the live CLOB API contract against the client's expectations in ~15s — run manually before every deploy, covering the four endpoints every trade touches (`fetchMarketsByIds`, `fetchOrderbook`, `fetchMarketTrades`, `fetchOrderStatus`).
 
 ---
 
